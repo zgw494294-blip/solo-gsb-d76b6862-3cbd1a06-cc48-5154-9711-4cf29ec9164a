@@ -1800,7 +1800,74 @@ curl -sS -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
 }
 ```
 
-### 25. 同值并发：空链与双方各自领先的分量
+### 25. 长短路径汇合：总是走边数最少的直达链
+
+以 `(r1, r2)` 记 clock。下面五条合法 put 中，`r1/2` 同时**直接依赖** `r1/1`
+（本副本 `seq - 1`）与 `r2/1`（clock 的 `r1 = 1` 分量），而 `r2/3` 只直接依赖
+`r2/2`。于是从 `r1/1` 到 `r2/3` 既有两条边的直达链 `r1/1 → r1/2 → r2/3`，也有
+三条边的绕路链 `r1/1 → r2/1 → r1/2 → r2/3`（长短路径在 `r1/2` 处汇合）。接口
+**总是**取边数最少的直达链，结果与事件在集合中的遍历顺序（即 Python 哈希种子）
+无关：
+
+```bash
+HID=$(curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "k", "put": "a",
+       "clock": {"r1": 1, "r2": 0}},
+      {"replica_id": "r2", "seq": 1, "key": "k", "put": "b",
+       "clock": {"r1": 1, "r2": 1}},
+      {"replica_id": "r1", "seq": 2, "key": "k", "put": "c",
+       "clock": {"r1": 2, "r2": 1}},
+      {"replica_id": "r2", "seq": 2, "key": "k", "put": "d",
+       "clock": {"r1": 2, "r2": 2}},
+      {"replica_id": "r2", "seq": 3, "key": "k", "put": "e",
+       "clock": {"r1": 2, "r2": 3}}
+    ]
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
+  -H 'Content-Type: application/json' \
+  -d '{"first": {"replica_id": "r1", "seq": 1},
+       "second": {"replica_id": "r2", "seq": 3}}'
+```
+
+```json
+{
+  "id": "7a31…",
+  "relation": "before",
+  "chain": [
+    {"replica_id": "r1", "seq": 1},
+    {"replica_id": "r1", "seq": 2},
+    {"replica_id": "r2", "seq": 3}
+  ]
+}
+```
+
+交换两个标识得到 `after`，证据链仍是同一条、且方向永远从较早事件到较晚事件：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
+  -H 'Content-Type: application/json' \
+  -d '{"first": {"replica_id": "r2", "seq": 3},
+       "second": {"replica_id": "r1", "seq": 1}}'
+```
+
+```json
+{
+  "id": "7a31…",
+  "relation": "after",
+  "chain": [
+    {"replica_id": "r1", "seq": 1},
+    {"replica_id": "r1", "seq": 2},
+    {"replica_id": "r2", "seq": 3}
+  ]
+}
+```
+
+### 26. 同值并发：空链与双方各自领先的分量
 
 两个副本并发地把同一个 key 写成**相同的值**（裁决上仍是冲突），因果关系为
 `concurrent`：

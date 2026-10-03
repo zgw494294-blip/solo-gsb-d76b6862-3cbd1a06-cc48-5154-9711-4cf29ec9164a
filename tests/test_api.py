@@ -3627,6 +3627,124 @@ def test_event_relation_chain_tie_broken_by_smallest_identity_sequence():
     ]
 
 
+def create_converging_paths_history():
+    """Five legal puts whose short and long dependency paths re-converge.
+
+    r1/2 directly depends on both r1/1 (its own predecessor) and r2/1 (its
+    r2 clock component), and r2/3 directly depends on both r2/2 and r1/2.
+    So r1/1 reaches r2/3 on the two-edge route r1/1 -> r1/2 -> r2/3 and on
+    the longer three-edge route r1/1 -> r2/1 -> r1/2 -> r2/3 (plus even
+    longer routes via r2/2); the fewest-edge chain wins.
+    """
+    r = hist_create(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0}),
+            ev("r2", 1, "k", put="b", clock={"r1": 1, "r2": 1}),
+            ev("r1", 2, "k", put="c", clock={"r1": 2, "r2": 1}),
+            ev("r2", 2, "k", put="d", clock={"r1": 2, "r2": 2}),
+            ev("r2", 3, "k", put="e", clock={"r1": 2, "r2": 3}),
+        ],
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def test_event_relation_converging_paths_takes_fewest_edge_chain():
+    # Regression: when a short and a long dependency path re-converge, the
+    # backwards distance traversal used to be depth-first.  Depending on set
+    # iteration order it could record the long route's distance first and the
+    # reconstructed chain then went r1/1 -> r2/1 -> r1/2 -> r2/3 (three
+    # edges) instead of the two-edge direct chain.
+    hid = create_converging_paths_history()
+
+    r = hist_event_relation(
+        hid, {"replica_id": "r1", "seq": 1}, {"replica_id": "r2", "seq": 3}
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["relation"] == "before"
+    assert data["chain"] == [
+        {"replica_id": "r1", "seq": 1},
+        {"replica_id": "r1", "seq": 2},
+        {"replica_id": "r2", "seq": 3},
+    ]
+
+
+def test_event_relation_converging_paths_swapped_identifiers_chain_unchanged():
+    # Swapping the anchors flips before->after, but the evidence chain always
+    # runs from the earlier event to the later one and stays the same chain.
+    hid = create_converging_paths_history()
+
+    r = hist_event_relation(
+        hid, {"replica_id": "r2", "seq": 3}, {"replica_id": "r1", "seq": 1}
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["relation"] == "after"
+    assert data["chain"] == [
+        {"replica_id": "r1", "seq": 1},
+        {"replica_id": "r1", "seq": 2},
+        {"replica_id": "r2", "seq": 3},
+    ]
+
+
+@pytest.mark.parametrize("seed", ["0", "1", "2", "3", "4", "5", "42"])
+def test_event_relation_converging_paths_chain_is_hash_seed_independent(
+    seed, tmp_path
+):
+    # The chosen chain must not depend on Python's hash randomisation (set
+    # iteration order).  Run the converging-paths query in a fresh interpreter
+    # with PYTHONHASHSEED pinned to each of several values.
+    code = """
+from fastapi.testclient import TestClient
+from app.main import app
+
+c = TestClient(app)
+r = c.post('/api/histories', json={
+    'replica_ids': ['r1', 'r2'],
+    'events': [
+        {'replica_id': 'r1', 'seq': 1, 'key': 'k', 'put': 'a',
+         'clock': {'r1': 1, 'r2': 0}},
+        {'replica_id': 'r2', 'seq': 1, 'key': 'k', 'put': 'b',
+         'clock': {'r1': 1, 'r2': 1}},
+        {'replica_id': 'r1', 'seq': 2, 'key': 'k', 'put': 'c',
+         'clock': {'r1': 2, 'r2': 1}},
+        {'replica_id': 'r2', 'seq': 2, 'key': 'k', 'put': 'd',
+         'clock': {'r1': 2, 'r2': 2}},
+        {'replica_id': 'r2', 'seq': 3, 'key': 'k', 'put': 'e',
+         'clock': {'r1': 2, 'r2': 3}},
+    ],
+})
+assert r.status_code == 201, r.text
+hid = r.json()['id']
+r = c.post(
+    f'/api/histories/{hid}/event-relation',
+    json={'first': {'replica_id': 'r1', 'seq': 1},
+          'second': {'replica_id': 'r2', 'seq': 3}},
+)
+assert r.status_code == 200, r.text
+data = r.json()
+assert data['relation'] == 'before'
+assert [(x['replica_id'], x['seq']) for x in data['chain']] == [
+    ('r1', 1), ('r1', 2), ('r2', 3)]
+print('ok')
+"""
+    env = dict(
+        os.environ,
+        PYTHONHASHSEED=seed,
+        PYTHONPATH="/workspace",
+        HISTORY_DB_PATH=str(tmp_path / f"seed-{seed}.db"),
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (seed, proc.stdout, proc.stderr)
+
+
 def test_event_relation_same_event_is_single_node_chain():
     hid = create_relation_history()
 

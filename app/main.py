@@ -118,6 +118,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections import deque
 from typing import Annotated, Optional
 
 from fastapi import FastAPI, Query, Request
@@ -1315,11 +1316,15 @@ def _shortest_dependency_chain(
             dependents.setdefault(dep, set()).add((ev.replica_id, ev.seq))
 
     # Fewest edges to ``end`` for every causal ancestor, via BFS backwards
-    # over the direct dependency edges.
+    # over the direct dependency edges.  The frontier is a FIFO queue: a
+    # depth-first stack could visit an ancestor first on a long route and
+    # freeze that non-minimal distance (depending on set iteration order),
+    # which would make the returned chain take a detour when short and long
+    # paths re-converge.
     dist: dict[tuple[str, int], int] = {end: 0}
-    frontier = [end]
+    frontier = deque([end])
     while frontier:
-        cur = frontier.pop()
+        cur = frontier.popleft()
         for dep in _direct_dependencies(by_id[cur], replica_ids):
             if dep not in dist:
                 dist[dep] = dist[cur] + 1
