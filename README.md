@@ -1800,7 +1800,81 @@ curl -sS -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
 }
 ```
 
-### 25. 同值并发：空链与双方各自领先的分量
+### 25. 长短路径汇合：始终取直接依赖边数最少的链
+
+长短两条依赖链可能在中间节点汇合，此时答案**不得**随事件集合的遍历顺序
+（哈希种子）漂移。以 `(r1, r2)` 记 clock，下面五条合法 put 事件为
+`r1/1=(1,0)`、`r2/1=(1,1)`、`r1/2=(2,1)`、`r2/2=(2,2)`、`r2/3=(2,3)`：
+
+```bash
+HID=$(curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "k", "put": "a",
+       "clock": {"r1": 1, "r2": 0}},
+      {"replica_id": "r2", "seq": 1, "key": "k", "put": "b",
+       "clock": {"r1": 1, "r2": 1}},
+      {"replica_id": "r1", "seq": 2, "key": "k", "put": "c",
+       "clock": {"r1": 2, "r2": 1}},
+      {"replica_id": "r2", "seq": 2, "key": "k", "put": "d",
+       "clock": {"r1": 2, "r2": 2}},
+      {"replica_id": "r2", "seq": 3, "key": "k", "put": "e",
+       "clock": {"r1": 2, "r2": 3}}
+    ]
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+```
+
+从 `r1/1` 到 `r2/3` 同时存在绕行长链 `r1/1 → r2/1 → r1/2 → r2/2 → r2/3`
+（4 条边，`r1/2` 与 `r2/3` 都是汇合点）和短链 `r1/1 → r1/2 → r2/3`
+（2 条边）。`first=r1/1`、`second=r2/3` 必须返回 `before` 与这条短链：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
+  -H 'Content-Type: application/json' \
+  -d '{"first": {"replica_id": "r1", "seq": 1},
+       "second": {"replica_id": "r2", "seq": 3}}'
+```
+
+```json
+{
+  "id": "1a7e…",
+  "relation": "before",
+  "chain": [
+    {"replica_id": "r1", "seq": 1},
+    {"replica_id": "r1", "seq": 2},
+    {"replica_id": "r2", "seq": 3}
+  ]
+}
+```
+
+交换两个标识返回 `after`，链仍然从较早事件排到较晚事件：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
+  -H 'Content-Type: application/json' \
+  -d '{"first": {"replica_id": "r2", "seq": 3},
+       "second": {"replica_id": "r1", "seq": 1}}'
+```
+
+```json
+{
+  "id": "1a7e…",
+  "relation": "after",
+  "chain": [
+    {"replica_id": "r1", "seq": 1},
+    {"replica_id": "r1", "seq": 2},
+    {"replica_id": "r2", "seq": 3}
+  ]
+}
+```
+
+最短边数由反向 BFS 保证（首次到达即最短距离），与集合遍历顺序无关；边数
+并列时再在每一步选择距终点少一条边的后继里 `(replica_id, seq)` 最小者
+（`seq` 按数值比较），因此同一历史的答案不受 Python 哈希种子影响。
+
+### 26. 同值并发：空链与双方各自领先的分量
 
 两个副本并发地把同一个 key 写成**相同的值**（裁决上仍是冲突），因果关系为
 `concurrent`：

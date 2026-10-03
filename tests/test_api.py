@@ -1,5 +1,6 @@
 """Tests for the multi-replica offline write reconciliation API."""
 
+import json
 import os
 import subprocess
 import sys
@@ -10,6 +11,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.main import (
+    Event,
+    _direct_dependencies,
+    _shortest_dependency_chain,
+)
 
 client = TestClient(app)
 
@@ -3834,4 +3840,235 @@ def test_event_relation_is_read_only_and_ignores_staged_events():
     assert r.json()["chain"] == [
         {"replica_id": "r1", "seq": 1},
         {"replica_id": "r1", "seq": 2},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Event relation regression: shortest chain at long/short path convergence,
+# independent of set iteration order / hash seed
+# ---------------------------------------------------------------------------
+
+
+def converging_history_events():
+    """The five puts from the convergence report (clock shown as (r1, r2)):
+
+    r1/1=(1,0), r2/1=(1,1), r1/2=(2,1), r2/2=(2,2), r2/3=(2,3).
+
+    From r1/1 to r2/3 a long path r1/1 -> r2/1 -> r1/2 -> r2/2 -> r2/3
+    (four edges) and the short path r1/1 -> r1/2 -> r2/3 (two edges)
+    converge at r1/2 and again at r2/3.
+    """
+
+    return [
+        ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0}),
+        ev("r2", 1, "k", put="b", clock={"r1": 1, "r2": 1}),
+        ev("r1", 2, "k", put="c", clock={"r1": 2, "r2": 1}),
+        ev("r2", 2, "k", put="d", clock={"r1": 2, "r2": 2}),
+        ev("r2", 3, "k", put="e", clock={"r1": 2, "r2": 3}),
+    ]
+
+
+def create_converging_history():
+    r = hist_create(["r1", "r2"], converging_history_events())
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def test_event_relation_converging_paths_pick_short_chain_earlier_to_later():
+    hid = create_converging_history()
+
+    # first=r1/1, second=r2/3 -> before with the two-edge short chain,
+    # not the four-edge detour through r2/1 and r2/2.
+    r = hist_event_relation(
+        hid, {"replica_id": "r1", "seq": 1}, {"replica_id": "r2", "seq": 3}
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["relation"] == "before"
+    assert data["chain"] == [
+        {"replica_id": "r1", "seq": 1},
+        {"replica_id": "r1", "seq": 2},
+        {"replica_id": "r2", "seq": 3},
+    ]
+
+    # Swapped identifiers -> after, but the chain still runs earlier->later.
+    r = hist_event_relation(
+        hid, {"replica_id": "r2", "seq": 3}, {"replica_id": "r1", "seq": 1}
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["relation"] == "after"
+    assert data["chain"] == [
+        {"replica_id": "r1", "seq": 1},
+        {"replica_id": "r1", "seq": 2},
+        {"replica_id": "r2", "seq": 3},
+    ]
+
+
+def _event(rid, seq, clock):
+    return Event(
+        replica_id=rid, seq=seq, key="k", put="v", clock=dict(clock)
+    )
+
+
+def _oracle_shortest_chain(replica_ids, events, start, end):
+    """Independent exhaustive oracle: lexicographically smallest simple
+    dependency path under (edges first, then the (rid, int seq) tuple
+    sequence)."""
+
+    by_id = {(e.replica_id, e.seq): e for e in events}
+    dependents = {}
+    for e in events:
+        for dep in _direct_dependencies(e, replica_ids):
+            dependents.setdefault(dep, set()).add((e.replica_id, e.seq))
+
+    best = None
+
+    def walk(node, path):
+        nonlocal best
+        if node == end:
+            candidate = tuple(path)
+            key = (len(candidate) - 1, candidate)
+            if best is None or key < best[0]:
+                best = (key, candidate)
+            return
+        for succ in dependents.get(node, ()):
+            if succ not in path:
+                path.append(succ)
+                walk(succ, path)
+                path.pop()
+
+    walk(start, [start])
+    assert best is not None
+    assert end in by_id and start in by_id
+    return list(best[1])
+
+
+def test_shortest_chain_matches_exhaustive_oracle_on_converging_histories():
+    # Two-replica convergence from the report, with the events handed in in
+    # every order -- the answer must never depend on list/set ordering.
+    rids2 = ["r1", "r2"]
+    events2 = [_event(rid, seq, clock) for rid, seq, clock in [
+        ("r1", 1, {"r1": 1, "r2": 0}),
+        ("r2", 1, {"r1": 1, "r2": 1}),
+        ("r1", 2, {"r1": 2, "r2": 1}),
+        ("r2", 2, {"r1": 2, "r2": 2}),
+        ("r2", 3, {"r1": 2, "r2": 3}),
+    ]]
+
+    # A three-replica diamond: r1/1 fans out to r2/1 and r3/1, both reconverge
+    # at r1/2; r2/2 depends on both r1/2 and r3/1, giving a second junction.
+    rids3 = ["r1", "r2", "r3"]
+    events3 = [_event(rid, seq, clock) for rid, seq, clock in [
+        ("r1", 1, {"r1": 1, "r2": 0, "r3": 0}),
+        ("r2", 1, {"r1": 1, "r2": 1, "r3": 0}),
+        ("r3", 1, {"r1": 1, "r2": 0, "r3": 1}),
+        ("r1", 2, {"r1": 2, "r2": 1, "r3": 1}),
+        ("r2", 2, {"r1": 2, "r2": 2, "r3": 1}),
+    ]]
+
+    import itertools
+
+    for replica_ids, base_events in [(rids2, events2), (rids3, events3)]:
+        idents = [(e.replica_id, e.seq) for e in base_events]
+        for order in itertools.permutations(base_events):
+            events = list(order)
+            by_id = {(e.replica_id, e.seq): e for e in events}
+            for start in idents:
+                for end in idents:
+                    if start == end:
+                        continue
+                    a, b = by_id[start], by_id[end]
+                    reachable = all(
+                        a.clock[r] <= b.clock[r] for r in replica_ids
+                    ) and any(a.clock[r] < b.clock[r] for r in replica_ids)
+                    if not reachable:
+                        continue
+                    got = _shortest_dependency_chain(
+                        replica_ids, events, start, end
+                    )
+                    expected = _oracle_shortest_chain(
+                        replica_ids, events, start, end
+                    )
+                    assert got == expected, (replica_ids, start, end, got, expected)
+
+
+def test_event_relation_converging_chain_stable_across_hash_seeds(tmp_path):
+    """The reported symptom was order dependence: run the converging query in
+    fresh interpreters under several PYTHONHASHSEED values and demand the same
+    short chain every time."""
+
+    db = tmp_path / "history.db"
+    setup = """
+from fastapi.testclient import TestClient
+from app.main import app
+
+c = TestClient(app)
+r = c.post('/api/histories', json={
+    'replica_ids': ['r1', 'r2'],
+    'events': [
+        {'replica_id': 'r1', 'seq': 1, 'key': 'k', 'put': 'a',
+         'clock': {'r1': 1, 'r2': 0}},
+        {'replica_id': 'r2', 'seq': 1, 'key': 'k', 'put': 'b',
+         'clock': {'r1': 1, 'r2': 1}},
+        {'replica_id': 'r1', 'seq': 2, 'key': 'k', 'put': 'c',
+         'clock': {'r1': 2, 'r2': 1}},
+        {'replica_id': 'r2', 'seq': 2, 'key': 'k', 'put': 'd',
+         'clock': {'r1': 2, 'r2': 2}},
+        {'replica_id': 'r2', 'seq': 3, 'key': 'k', 'put': 'e',
+         'clock': {'r1': 2, 'r2': 3}},
+    ],
+})
+print(r.json()['id'])
+"""
+    setup_proc = subprocess.run(
+        [sys.executable, "-c", setup],
+        env=dict(
+            os.environ,
+            HISTORY_DB_PATH=str(db),
+            PYTHONPATH="/workspace",
+            PYTHONHASHSEED="0",
+        ),
+        capture_output=True,
+        text=True,
+    )
+    assert setup_proc.returncode == 0, setup_proc.stderr
+    hid = setup_proc.stdout.strip()
+
+    query = f"""
+from fastapi.testclient import TestClient
+from app.main import app
+import json
+
+c = TestClient(app)
+r = c.post('/api/histories/{hid}/event-relation', json={{
+    'first': {{'replica_id': 'r1', 'seq': 1}},
+    'second': {{'replica_id': 'r2', 'seq': 3}},
+}})
+print(json.dumps(r.json(), sort_keys=True))
+"""
+    answers = set()
+    for seed in ("0", "1", "2", "7", "42", "123456"):
+        proc = subprocess.run(
+            [sys.executable, "-c", query],
+            env=dict(
+                os.environ,
+                HISTORY_DB_PATH=str(db),
+                PYTHONPATH="/workspace",
+                PYTHONHASHSEED=seed,
+            ),
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, (seed, proc.stderr)
+        answers.add(proc.stdout.strip())
+
+    assert len(answers) == 1
+    data = json.loads(next(iter(answers)))
+    assert data["id"] == hid
+    assert data["relation"] == "before"
+    assert data["chain"] == [
+        {"replica_id": "r1", "seq": 1},
+        {"replica_id": "r1", "seq": 2},
+        {"replica_id": "r2", "seq": 3},
     ]

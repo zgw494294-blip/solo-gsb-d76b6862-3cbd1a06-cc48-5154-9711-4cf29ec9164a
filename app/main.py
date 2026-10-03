@@ -118,6 +118,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections import deque
 from typing import Annotated, Optional
 
 from fastapi import FastAPI, Query, Request
@@ -1315,11 +1316,15 @@ def _shortest_dependency_chain(
             dependents.setdefault(dep, set()).add((ev.replica_id, ev.seq))
 
     # Fewest edges to ``end`` for every causal ancestor, via BFS backwards
-    # over the direct dependency edges.
+    # over the direct dependency edges.  A FIFO queue is essential: a stack
+    # (DFS) can record a longer detour distance first depending on the
+    # unspecified set iteration order -- the assigned distance is then both
+    # non-minimal and hash-seed-dependent.  BFS first-discovery distances are
+    # minimal regardless of neighbour iteration order.
     dist: dict[tuple[str, int], int] = {end: 0}
-    frontier = [end]
+    frontier: deque[tuple[str, int]] = deque([end])
     while frontier:
-        cur = frontier.pop()
+        cur = frontier.popleft()
         for dep in _direct_dependencies(by_id[cur], replica_ids):
             if dep not in dist:
                 dist[dep] = dist[cur] + 1
